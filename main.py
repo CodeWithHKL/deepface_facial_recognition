@@ -1,130 +1,155 @@
-import cv2
+"""Real-time face recognition using DeepFace embeddings and a webcam."""
+import argparse
+import hashlib
 import os
+import sys
+
+import cv2
 import numpy as np
 from deepface import DeepFace
 
-# ---------------------------
-# CONFIGURATION
-# ---------------------------
-dataset_path = "dataset/"       # dataset folder with subfolders per person
-model_name = "Facenet"
-detector_backend = "opencv"     # face detector backend
-threshold = 0.4                 # strict cosine similarity threshold
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+DETECT_WIDTH = 640  # frames are downscaled to this width before detection
 
-# ---------------------------
-# HELPER FUNCTIONS
-# ---------------------------
 
-def cosine_similarity(a, b):
-    a = np.array(a, dtype=np.float32).flatten()
-    b = np.array(b, dtype=np.float32).flatten()
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--dataset", default="dataset/", help="folder with one subfolder of images per person")
+    p.add_argument("--cache", default="embeddings.npz", help="where enrolled embeddings are cached")
+    p.add_argument("--rebuild", action="store_true", help="ignore the cache and re-enroll the dataset")
+    p.add_argument("--model", default="Facenet", help="DeepFace recognition model")
+    p.add_argument("--detector", default="opencv", help="DeepFace detector backend")
+    p.add_argument("--threshold", type=float, default=0.60,
+                   help="minimum cosine similarity to accept a match (Facenet cosine distance 0.40 = 0.60)")
+    p.add_argument("--camera", type=int, default=0, help="webcam index")
+    p.add_argument("--every", type=int, default=5, help="run recognition every N frames")
+    return p.parse_args()
 
-def load_dataset_embeddings(dataset_path):
-    """Load all face embeddings from dataset folder."""
-    known_embeddings = {}
-    for person_name in os.listdir(dataset_path):
-        person_folder = os.path.join(dataset_path, person_name)
-        if not os.path.isdir(person_folder):
+
+def normalize(v):
+    v = np.asarray(v, dtype=np.float32).flatten()
+    return v / np.linalg.norm(v)
+
+
+def dataset_images(dataset_path):
+    """Yield (person, path) for every image in dataset_path/<person>/."""
+    for person in sorted(os.listdir(dataset_path)):
+        folder = os.path.join(dataset_path, person)
+        if not os.path.isdir(folder):
             continue
-        embeddings_list = []
-        for file in os.listdir(person_folder):
-            if file.lower().endswith((".jpg", ".jpeg", ".png")):
-                img_path = os.path.join(person_folder, file)
-                try:
-                    faces = DeepFace.extract_faces(
-                        img_path,
-                        detector_backend=detector_backend,
-                        enforce_detection=True
-                    )
-                    for face_obj in faces:
-                        face_array = face_obj['face']
-                        emb = DeepFace.represent(face_array, model_name=model_name, enforce_detection=False)[0]['embedding']
-                        embeddings_list.append(np.array(emb, dtype=np.float32).flatten())
-                    print(f"Loaded {file} for {person_name}")
-                except Exception as e:
-                    print(f"Failed to process {file}: {e}")
-        if embeddings_list:
-            known_embeddings[person_name] = embeddings_list
-    return known_embeddings
+        for file in sorted(os.listdir(folder)):
+            if file.lower().endswith(IMAGE_EXTENSIONS):
+                yield person, os.path.join(folder, file)
 
-def find_closest_face(face_embedding, known_embeddings, threshold=0.9):
-    """Find the closest matching person."""
-    max_sim = -1
-    identity = "Unknown"
-    face_embedding = np.array(face_embedding, dtype=np.float32).flatten()
-    for name, embeds_list in known_embeddings.items():
-        for db_emb in embeds_list:
-            db_emb = np.array(db_emb, dtype=np.float32).flatten()
-            sim = cosine_similarity(face_embedding, db_emb)
-            if sim > max_sim:
-                max_sim = sim
-                identity = name
-    if max_sim < threshold:
-        return "Unknown", max_sim
-    return identity, max_sim
 
-def get_face_coords(area, face_array):
-    """Safely extract bounding box coordinates."""
-    if all(k in area for k in ('x','y','w','h')):
-        return area['x'], area['y'], area['w'], area['h']
-    elif all(k in area for k in ('x1','y1','x2','y2')):
-        return area['x1'], area['y1'], area['x2']-area['x1'], area['y2']-area['y1']
-    else:
-        h, w = face_array.shape[:2]
-        return 0, 0, w, h
+def dataset_signature(dataset_path, model, detector):
+    """Hash of the settings and image files, used to detect a stale cache."""
+    h = hashlib.sha256(f"{model}|{detector}".encode())
+    for _, path in dataset_images(dataset_path):
+        st = os.stat(path)
+        h.update(f"{path}|{st.st_size}|{int(st.st_mtime)}".encode())
+    return h.hexdigest()
 
-# ---------------------------
-# LOAD DATASET EMBEDDINGS
-# ---------------------------
-print("Loading known faces from dataset...")
-known_embeddings = load_dataset_embeddings(dataset_path)
-print(f"Total known people: {len(known_embeddings)}")
 
-# ---------------------------
-# START WEBCAM
-# ---------------------------
-cap = cv2.VideoCapture(0)
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-print("Starting webcam... Press 'q' to quit.")
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    display_frame = frame.copy()
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    prelim_faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5)
-
-    if len(prelim_faces) == 0:
-        cv2.imshow("Real-Time Face Recognition", display_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-        continue
-
-    for (x, y, w, h) in prelim_faces:
-        face_crop = frame[y:y+h, x:x+w]
-
+def enroll(dataset_path, model, detector):
+    """Embed every dataset image. Returns (names, matrix of normalized embeddings)."""
+    names, vectors = [], []
+    for person, path in dataset_images(dataset_path):
         try:
-            # Extract embedding for the cropped face
-            embedding = DeepFace.represent(face_crop, model_name=model_name, enforce_detection=True)[0]['embedding']
-            embedding = np.array(embedding, dtype=np.float32).flatten()
-
-            # Compare with known embeddings
-            name, sim = find_closest_face(embedding, known_embeddings, threshold)
-            print(f"Similarity: {sim:.3f} -> Recognized: {name}")
-
-            # Draw rectangle and label
-            cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(display_frame, name, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
+            faces = DeepFace.represent(path, model_name=model, detector_backend=detector,
+                                       enforce_detection=True)
         except Exception as e:
-            print("Face detection failed:", e)
+            print(f"Skipped {path}: {e}")
+            continue
+        # A photo may contain several faces; assume the largest one is the person.
+        face = max(faces, key=lambda f: f["facial_area"]["w"] * f["facial_area"]["h"])
+        names.append(person)
+        vectors.append(normalize(face["embedding"]))
+        print(f"Enrolled {os.path.basename(path)} for {person}")
+    if not vectors:
+        return np.array([], dtype=str), np.empty((0, 0), dtype=np.float32)
+    return np.array(names), np.stack(vectors)
 
-    cv2.imshow("Real-Time Face Recognition", display_frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
 
-cap.release()
-cv2.destroyAllWindows()
+def load_known_faces(args):
+    """Load enrolled embeddings from the cache, re-enrolling if it is missing or stale."""
+    signature = dataset_signature(args.dataset, args.model, args.detector)
+    if not args.rebuild and os.path.exists(args.cache):
+        with np.load(args.cache, allow_pickle=False) as data:
+            if str(data["signature"]) == signature:
+                print(f"Loaded cached embeddings from {args.cache}")
+                return data["names"], data["embeddings"]
+    print("Enrolling faces from dataset...")
+    names, embeddings = enroll(args.dataset, args.model, args.detector)
+    if len(names):
+        np.savez(args.cache, names=names, embeddings=embeddings, signature=signature)
+    return names, embeddings
+
+
+def identify(embedding, names, embeddings, threshold):
+    """Return (name, similarity) of the best match, or ("Unknown", similarity)."""
+    sims = embeddings @ normalize(embedding)
+    best = int(np.argmax(sims))
+    if sims[best] < threshold:
+        return "Unknown", float(sims[best])
+    return str(names[best]), float(sims[best])
+
+
+def recognize(frame, args, names, embeddings):
+    """Detect and identify all faces in a frame. Returns [(x, y, w, h, label)] in frame coordinates."""
+    scale = min(1.0, DETECT_WIDTH / frame.shape[1])
+    small = cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1.0 else frame
+    try:
+        faces = DeepFace.represent(small, model_name=args.model, detector_backend=args.detector,
+                                   enforce_detection=True)
+    except ValueError:  # no face found
+        return []
+    results = []
+    for face in faces:
+        a = face["facial_area"]
+        name, sim = identify(face["embedding"], names, embeddings, args.threshold)
+        results.append((int(a["x"] / scale), int(a["y"] / scale),
+                        int(a["w"] / scale), int(a["h"] / scale), f"{name} ({sim:.2f})"))
+    return results
+
+
+def main():
+    args = parse_args()
+    if not os.path.isdir(args.dataset):
+        sys.exit(f"Dataset folder not found: {args.dataset} (expected {args.dataset}<person>/<image>.jpg)")
+
+    names, embeddings = load_known_faces(args)
+    if not len(names):
+        sys.exit("No faces could be enrolled from the dataset.")
+    print(f"Known people: {', '.join(sorted(set(names.tolist())))}")
+
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        sys.exit(f"Could not open camera {args.camera}")
+    print("Starting webcam... Press 'q' to quit.")
+
+    results, frame_count = [], 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_count % args.every == 0:
+                results = recognize(frame, args, names, embeddings)
+            frame_count += 1
+
+            for x, y, w, h, label in results:
+                color = (0, 255, 0) if not label.startswith("Unknown") else (0, 0, 255)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(frame, label, (x, max(y - 10, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            cv2.imshow("Real-Time Face Recognition", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
